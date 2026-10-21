@@ -15,7 +15,7 @@
 </style>
 </head>
 <body>
-<header>Y214 <b>Probe</b> v1.0.1 — microphone test</header>
+<header>Y214 <b>Probe</b> v1.0.2 — microphone test</header>
 <div id="banner">starting…</div>
 <div id="log"></div>
 <script>
@@ -32,8 +32,29 @@ function post(section, data) {
 }
 function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
-async function recordDevice(deviceId, seconds) {
-  var stream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: deviceId } } });
+// Remote-mic diagnosis: does the track ever unmute / carry samples while the MIC button is pressed? which key events does the app see?
+async function remoteDiag(deviceId, seconds) {
+  var ev = [], t0 = Date.now(), ts = function () { return ((Date.now() - t0) / 1000).toFixed(1) + 's '; };
+  var stream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: deviceId }, echoCancellation: false, autoGainControl: false, noiseSuppression: false } });
+  var track = stream.getAudioTracks()[0];
+  ev.push(ts() + 'start muted=' + track.muted + ' state=' + track.readyState + ' enabled=' + track.enabled);
+  track.onmute = function () { ev.push(ts() + 'MUTE'); }; track.onunmute = function () { ev.push(ts() + 'UNMUTE'); }; track.onended = function () { ev.push(ts() + 'ENDED'); };
+  var keyH = function (e) { ev.push(ts() + 'key ' + e.type + ' code=' + e.keyCode + ' key=' + (e.key || '')); };
+  document.addEventListener('keydown', keyH); document.addEventListener('keyup', keyH);
+  var Ctx = window.AudioContext || window.webkitAudioContext, ctx = new Ctx(), src = ctx.createMediaStreamSource(stream), an = ctx.createAnalyser(); an.fftSize = 1024; src.connect(an);
+  var buf = new Uint8Array(an.fftSize), max = 0, firstAt = null, t1 = Date.now();
+  while (Date.now() - t1 < seconds * 1000) {
+    an.getByteTimeDomainData(buf); var s = 0; for (var k = 0; k < buf.length; k++) { var v = (buf[k] - 128) / 128; s += v * v; }
+    var rms = Math.sqrt(s / buf.length); if (rms > max) max = rms; if (rms > 0.0005 && firstAt === null) { firstAt = ts(); ev.push(firstAt + 'first signal rms=' + rms.toFixed(4)); } await sleep(50);
+  }
+  document.removeEventListener('keydown', keyH); document.removeEventListener('keyup', keyH);
+  stream.getTracks().forEach(function (t) { t.stop(); }); try { ctx.close(); } catch (e) {}
+  var keys = 'n/a'; try { keys = tizen.tvinputdevice.getSupportedKeys().map(function (k) { return k.name; }).join(','); } catch (e) { keys = 'ERR ' + e; }
+  return { events: ev, maxRms: +max.toFixed(5), supportedKeys: keys };
+}
+
+async function recordDevice(deviceId, seconds, constraints) {
+  var stream = await navigator.mediaDevices.getUserMedia({ audio: Object.assign({ deviceId: { exact: deviceId } }, constraints || {}) });
   var track = stream.getAudioTracks()[0];
   var Ctx = window.AudioContext || window.webkitAudioContext, ctx = new Ctx();
   var src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(4096, 1, 1);
@@ -60,17 +81,24 @@ async function run() {
   catch (e) { say('getUserMedia failed: ' + e); post('mic.fail', String(e)); return; }
   show('audio inputs: ' + devices.map(function (d) { return d.label || d.deviceId.slice(0, 8); }).join(' | '));
   post('mic.devices', devices.map(function (d) { return { label: d.label, id: d.deviceId.slice(0, 12) }; }));
-  for (var i = 0; i < devices.length; i++) {
-    var d = devices[i], remote = /remote/i.test(d.label);
-    var how = remote ? 'HOLD the MIC button on the remote and TALK' : 'TALK to the TV in a normal voice';
-    for (var c = 5; c >= 1; c--) { say('Input ' + (i + 1) + '/' + devices.length + ': ' + d.label + '\n' + how + ' — starting in ' + c + ' s'); await sleep(1000); }
-    say('RECORDING ' + d.label + ' — ' + how, true);
+  var builtin = devices.filter(function (d) { return !/remote/i.test(d.label); })[0], remote = devices.filter(function (d) { return /remote/i.test(d.label); })[0];
+  var plan = [
+    { name: 'builtin-normal', dev: builtin, how: 'Say CLEARLY, from where you sit, in a NORMAL voice:\n"turn on the living room light"', secs: 6 },
+    { name: 'builtin-loud',   dev: builtin, how: 'Say it again, LOUD and clear:\n"turn on the living room light"', secs: 6 },
+    { name: 'remote-diag',    dev: remote,  how: 'Hold the MIC button on the remote for 3 s while TALKING,\nrelease, wait 2 s, then hold again for 3 s', secs: 12, diag: true }
+  ];
+  for (var i = 0; i < plan.length; i++) {
+    var p = plan[i]; if (!p.dev) { show('[' + p.name + '] input not found'); post('mic.result.' + p.name, { error: 'input not found' }); continue; }
+    for (var c = 5; c >= 1; c--) { say('Test ' + (i + 1) + '/' + plan.length + ' (' + p.dev.label + ')\n' + p.how + '\nstarting in ' + c + ' s'); await sleep(1000); }
+    say('RECORDING — ' + p.how.split('\n')[0], true);
     try {
-      var r = await recordDevice(d.deviceId, 6);
-      var audio = r.pcm16k_b64; delete r.pcm16k_b64;
-      r.label = d.label; show('[' + d.label + '] rms/s ' + JSON.stringify(r.rmsPerSec) + ' peak ' + r.peak + ' @' + r.sampleRate + ' Hz');
-      post('mic.result.' + i, r); post('mic.audio.' + i, { label: d.label, rate: 16000, pcm16_b64: audio });
-    } catch (e) { show('[' + d.label + '] FAILED ' + e); post('mic.result.' + i, { label: d.label, error: String(e) }); }
+      if (p.diag) { var dg = await remoteDiag(p.dev.deviceId, p.secs); show('[' + p.name + '] maxRms ' + dg.maxRms + ' events: ' + dg.events.join(' | ')); post('mic.result.' + p.name, dg); }
+      else {
+        var r = await recordDevice(p.dev.deviceId, p.secs); var audio = r.pcm16k_b64; delete r.pcm16k_b64;
+        r.label = p.dev.label; show('[' + p.name + '] rms/s ' + JSON.stringify(r.rmsPerSec) + ' peak ' + r.peak);
+        post('mic.result.' + p.name, r); post('mic.audio.' + p.name, { label: p.dev.label, rate: 16000, pcm16_b64: audio });
+      }
+    } catch (e) { show('[' + p.name + '] FAILED ' + e); post('mic.result.' + p.name, { error: String(e) }); }
   }
   say('Done — report sent to the laptop. Press Return to exit.');
   post('done', { t: new Date().toISOString() });
