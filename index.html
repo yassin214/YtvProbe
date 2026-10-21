@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Y214 Probe</title>
+<script src="$WEBAPIS/webapis/webapis.js"></script>
+<style>
+  :root { --void:#0b1320; --text:#e8f1ff; --muted:#8aa0c0; --primary:#00c2d1; --warn:#ffd166; }
+  html,body { margin:0; height:100%; background:var(--void); color:var(--text); font-family:monospace; }
+  header { padding:1.2vw 2vw; font-size:2.6vw; } header b { color:var(--primary); }
+  #banner { padding:0 2vw; font-size:2.4vw; color:var(--warn); min-height:3.4vw; }
+  #log { white-space:pre-wrap; padding:1vw 2vw; font-size:1.5vw; line-height:1.35; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>Y214 <b>Probe</b> — TV capability report</header>
+<div id="banner">starting…</div>
+<div id="log"></div>
+<script>
+// Collects what Tizen lets an app see, tests the microphone, and POSTs each section to the receiver on the XPS laptop.
+var RECV = 'http://192.168.3.96:8099/probe';
+var logEl = document.getElementById('log'), banner = document.getElementById('banner');
+function show(t) { logEl.textContent += t + '\n'; }
+function say(t) { banner.textContent = t; }
+function post(section, data) {
+  var body = JSON.stringify({ section: section, data: data });
+  try { fetch(RECV, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain' }, body: body }).catch(function (e) { show('POST failed [' + section + ']: ' + e); }); }
+  catch (e) { show('POST exception [' + section + ']: ' + e); }
+}
+function safe(fn) { try { var v = fn(); return (v === undefined ? 'undefined' : v); } catch (e) { return 'ERR ' + e; } }
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+function section(name, data) { show('[' + name + '] ' + JSON.stringify(data).slice(0, 220)); post(name, data); }
+
+async function run() {
+  post('hello', { t: new Date().toISOString() });
+  section('env', {
+    ua: navigator.userAgent, screen: screen.width + 'x' + screen.height, inner: innerWidth + 'x' + innerHeight, dpr: devicePixelRatio,
+    href: location.href, hasTizen: typeof tizen !== 'undefined', hasWebapis: typeof webapis !== 'undefined',
+    webapisKeys: safe(function () { return Object.keys(webapis); })
+  });
+
+  if (typeof webapis !== 'undefined') {
+    var pi = webapis.productinfo;
+    section('productinfo', pi ? {
+      model: safe(function () { return pi.getModel(); }), realModel: safe(function () { return pi.getRealModel(); }),
+      firmware: safe(function () { return pi.getFirmware(); }), duid: safe(function () { return pi.getDuid(); }),
+      version: safe(function () { return pi.getVersion(); }), smartTVServer: safe(function () { return pi.getSmartTVServerType(); }),
+      ud: safe(function () { return pi.isUdPanelSupported(); }), ultra: safe(function () { return pi.is8KPanelSupported && pi.is8KPanelSupported(); })
+    } : 'no webapis.productinfo');
+    var nw = webapis.network;
+    section('network', nw ? {
+      type: safe(function () { return nw.getActiveConnectionType(); }), ip: safe(function () { return nw.getIp(); }),
+      gw: safe(function () { return nw.getGateway(); }), dns: safe(function () { return nw.getDns(); }),
+      mac: safe(function () { return nw.getMac(); }), mask: safe(function () { return nw.getSubnetMask(); })
+    } : 'no webapis.network');
+  }
+
+  if (typeof tizen !== 'undefined' && tizen.systeminfo) {
+    var props = ['BUILD', 'CPU', 'DISPLAY', 'LOCALE', 'MEMORY', 'STORAGE', 'ETHERNET_NETWORK', 'WIFI_NETWORK', 'NETWORK'];
+    var sys = {};
+    for (var i = 0; i < props.length; i++) {
+      (function (p) {
+        tizen.systeminfo.getPropertyValue(p, function (v) { sys[p] = v; post('systeminfo.' + p, v); }, function (e) { sys[p] = 'ERR ' + (e && e.message); post('systeminfo.' + p, 'ERR ' + (e && e.message)); });
+      })(props[i]);
+    }
+    await sleep(1500); show('[systeminfo] requested ' + props.length + ' properties');
+  } else { section('systeminfo', 'no tizen.systeminfo'); }
+
+  if (typeof tizen !== 'undefined' && tizen.application && tizen.application.getAppsInfo) {
+    await new Promise(function (resolve) {
+      var timer = setTimeout(function () { section('apps', 'getAppsInfo gave no answer in 6 s'); resolve(); }, 6000);
+      tizen.application.getAppsInfo(function (list) { clearTimeout(timer); section('apps', { count: list.length, apps: list.map(function (a) { return a.id + ' | ' + a.name; }) }); resolve(); },
+        function (e) { clearTimeout(timer); section('apps', 'ERR ' + (e && e.message)); resolve(); });
+    });
+  } else { section('apps', 'no tizen.application.getAppsInfo'); }
+
+  // ---- microphone test ----
+  var mic = { hasMediaDevices: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia), secureContext: window.isSecureContext };
+  try { mic.devices = (await navigator.mediaDevices.enumerateDevices()).map(function (d) { return d.kind + ':' + (d.label || '?'); }); } catch (e) { mic.devices = 'ERR ' + e; }
+  section('mic.pre', mic);
+  say('MIC TEST in 5 s — when it says SPEAK, hold the MIC button on the remote and talk for 6 s');
+  await sleep(5000);
+  try {
+    var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    var track = stream.getAudioTracks()[0];
+    var ctx = new (window.AudioContext || window.webkitAudioContext)();
+    var src = ctx.createMediaStreamSource(stream), an = ctx.createAnalyser(); an.fftSize = 1024; src.connect(an);
+    var buf = new Uint8Array(an.fftSize), max = 0, sum = 0, n = 0;
+    say('SPEAK NOW (6 s) — hold the MIC button on the remote');
+    var t0 = Date.now();
+    while (Date.now() - t0 < 6000) {
+      an.getByteTimeDomainData(buf); var s = 0; for (var k = 0; k < buf.length; k++) { var v = (buf[k] - 128) / 128; s += v * v; }
+      var rms = Math.sqrt(s / buf.length); if (rms > max) max = rms; sum += rms; n++; await sleep(50);
+    }
+    section('mic.result', { granted: true, label: track.label, settings: track.getSettings ? track.getSettings() : null, state: track.readyState, rmsMax: +max.toFixed(4), rmsAvg: +(sum / n).toFixed(4), samples: n, sampleRate: ctx.sampleRate });
+    stream.getTracks().forEach(function (t) { t.stop(); });
+  } catch (e) { section('mic.result', { granted: false, error: String(e) + (e && e.name ? ' [' + e.name + ']' : '') }); }
+  say('Done — report sent to the laptop. Press Return to exit.');
+  post('done', { t: new Date().toISOString() });
+}
+run().catch(function (e) { say('Crashed: ' + e); post('crash', String(e)); });
+</script>
+</body>
+</html>
